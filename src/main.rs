@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::io::{self, Cursor, Seek};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio::time;
+use tracing::info;
 trait BufferExt {
     async fn read_u32_v(&mut self) -> Result<u32, io::Error>;
     async fn read_string(&mut self) -> Result<String, io::Error>;
@@ -73,71 +74,55 @@ where
     }
 }
 
-type Tx = mpsc::UnboundedSender<Vec<u8>>;
-type Rx = mpsc::UnboundedReceiver<Vec<u8>>;
-
-struct State {
-    tcp_tx: HashMap<SocketAddr, Tx>,
-    udp_peers: HashMap<SocketAddr, UdpPeer>,
-}
-
-impl State {
-    fn new() -> Self {
-        Self {
-            tcp_tx: HashMap::new(),
-            udp_peers: HashMap::new(),
-        }
-    }
-
-    async fn tcp_broadcast(&mut self, sender: SocketAddr, message: &Vec<u8>) {
-        for p in self.tcp_tx.iter_mut() {
-            if *p.0 != sender {
-                p.1.send(message.clone()).unwrap();
-            }
-        }
-    }
-
-    async fn tcp_send(&mut self, send_to: SocketAddr, message: &Vec<u8>) {
-        self.tcp_tx[&send_to].send(message.clone()).unwrap();
-    }
+#[derive(Debug, Clone)]
+enum TcpCommand {
+    Broadcast {
+        sender_addr: SocketAddr,
+        game: String,
+        message: Vec<u8>,
+    },
+    Send {
+        to_addr: SocketAddr,
+        message: Vec<u8>,
+    },
 }
 
 struct TcpPeer {
-    stream: TcpStream,
     addr: SocketAddr,
-    rx: Rx,
-    id: String,
-    name: String,
-    game: String,
+    id: String, // id == addr
+    player_name: String,
+    game_uid: String, // game_uid = md5(unique_key) + pwd
     game_name: String,
     has_password: bool,
+    tcp_tx: broadcast::Sender<TcpCommand>,
+    tcp_rx: broadcast::Receiver<TcpCommand>,
 }
 
 impl TcpPeer {
-    async fn new(state: Arc<Mutex<State>>, stream: TcpStream) -> io::Result<Self> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let addr = stream.peer_addr()?;
-        state.lock().await.tcp_tx.insert(addr, tx);
-        Ok(Self {
-            rx,
-            stream,
+    fn new(
+        addr: SocketAddr,
+        tcp_tx: broadcast::Sender<TcpCommand>,
+        tcp_rx: broadcast::Receiver<TcpCommand>,
+    ) -> Self {
+        Self {
             addr,
-            id: addr.to_string(),
-            name: "".into(),
-            game: "".into(),
+            tcp_tx,
+            tcp_rx,
+            id: "".into(),
+            player_name: "".into(),
+            game_uid: "".into(),
             game_name: "".into(),
             has_password: false,
-        })
+        }
     }
 }
 
 struct UdpPeer {
     addr: SocketAddr,
     id: String,
-    game: String,
+    game_uid: String,
     room: u16,
     previous_room: u16,
-    killed: bool,
     last_connection: SystemTime,
 }
 
@@ -146,52 +131,75 @@ impl UdpPeer {
         Self {
             addr,
             id: "".into(),
-            game: "".into(),
+            game_uid: "".into(),
             room: u16::MAX,
             previous_room: u16::MAX,
-            killed: false,
             last_connection: SystemTime::now(),
         }
     }
 }
 
+#[derive(Debug, Clone)]
+enum UdpCommand {
+    CheckConnections,
+    Broadcast {
+        sender_addr: SocketAddr,
+        game: String,
+        room: u16,
+        previous_room: u16,
+        message: Vec<u8>,
+    },
+}
+
+const TCP_SERVER_PORT: i32 = 8002;
+const UDP_SERVER_PORT: i32 = 8003;
+
 #[tokio::main]
 async fn main() {
-    // Shared state
-    let state = Arc::new(Mutex::new(State::new()));
+    // Initialize logger
+    let subscriber = tracing_subscriber::FmtSubscriber::new();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+
+    // Create channel
+    let (tcp_tx, _) = broadcast::channel::<TcpCommand>(16);
+    let (udp_tx, udp_rx) = mpsc::channel::<UdpCommand>(16);
 
     // Tcp server
-    let tcp_listener = TcpListener::bind("127.0.0.1:8002").await.unwrap();
-    println!("Server sockets running at port 8002");
-    let state_tcp = Arc::clone(&state);
+    let tcp_listener = TcpListener::bind(format!("127.0.0.1:{}", TCP_SERVER_PORT))
+        .await
+        .unwrap();
+    info!("tcp server running at port {}", TCP_SERVER_PORT);
     let tcp_server = tokio::spawn(async move {
         loop {
             let (stream, _) = tcp_listener.accept().await.unwrap();
-            let state_tcp = Arc::clone(&state_tcp);
+            let tcp_tx = tcp_tx.clone();
+            let tcp_rx = tcp_tx.subscribe();
+            let peer = TcpPeer::new(stream.peer_addr().unwrap(), tcp_tx, tcp_rx);
             tokio::spawn(async move {
-                _ = process_tcp(state_tcp, stream).await;
+                _ = process_tcp(stream, peer).await;
             });
         }
     });
 
     // Udp server
-    let mut udp_socket = UdpSocket::bind("127.0.0.1:8003").await.unwrap();
-    println!("Server sockets UDP running at port 8003");
-    let state_udp = Arc::clone(&state);
+    let udp_socket = UdpSocket::bind(format!("127.0.0.1:{}", UDP_SERVER_PORT))
+        .await
+        .unwrap();
+    info!("udp server running at port {}", UDP_SERVER_PORT);
+    let udp_tx_serv = udp_tx.clone();
     let udp_server = tokio::spawn(async move {
-        loop {
-            let state_udp = Arc::clone(&state_udp);
-            _ = process_udp(state_udp, &mut udp_socket).await;
-        }
+        _ = process_udp(udp_socket, udp_tx_serv, udp_rx).await;
     });
 
     // Udp connection checker
-    let state_udp_checker = Arc::clone(&state);
+    let udp_tx_checker = udp_tx.clone();
     let udp_connection_checker = tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(120));
         loop {
-            let state_udp_checker = Arc::clone(&state_udp_checker);
-            check_udp_connections(state_udp_checker).await;
+            udp_tx_checker
+                .send(UdpCommand::CheckConnections)
+                .await
+                .unwrap();
             interval.tick().await;
         }
     });
@@ -199,30 +207,43 @@ async fn main() {
     _ = tokio::join!(tcp_server, udp_server, udp_connection_checker);
 }
 
-async fn process_tcp(state: Arc<Mutex<State>>, stream: TcpStream) -> io::Result<()> {
+async fn process_tcp(mut stream: TcpStream, mut peer: TcpPeer) -> io::Result<()> {
     let mut buf = [0u8; 1024];
-    let mut peer = TcpPeer::new(Arc::clone(&state), stream).await?;
 
     // Send self-id
     let mut writer = Cursor::new(vec![]);
     writer.write_u8(6).await?;
     writer.write_string(&peer.id).await?;
-    state
-        .lock()
-        .await
-        .tcp_send(peer.addr, writer.get_ref())
-        .await;
+    peer.tcp_tx
+        .send(TcpCommand::Send {
+            to_addr: peer.addr,
+            message: writer.get_ref().clone(),
+        })
+        .unwrap();
 
     loop {
         tokio::select! {
-            Some(msg) = peer.rx.recv() => {
-                // Receive broadcast message
-                let mut writer = Cursor::new(vec![]);
-                writer.write_u32_v(msg.len() as u32).await?;
-                writer.write_all(&msg).await?;
-                peer.stream.write(writer.get_ref()).await?;
+            Ok(cmd) = peer.tcp_rx.recv() => {
+                match cmd {
+                    TcpCommand::Broadcast {sender_addr, game, message} => {
+                        if peer.addr != sender_addr && peer.game_uid == game {
+                            let mut writer = Cursor::new(vec![]);
+                            writer.write_u32_v(message.len() as u32).await?;
+                            writer.write_all(&message).await?;
+                            stream.write(writer.get_ref()).await?;
+                        }
+                    }
+                    TcpCommand::Send {to_addr, message} => {
+                        if peer.addr == to_addr {
+                            let mut writer = Cursor::new(vec![]);
+                            writer.write_u32_v(message.len() as u32).await?;
+                            writer.write_all(&message).await?;
+                            stream.write(writer.get_ref()).await?;
+                        }
+                    }
+                }
             }
-            result = peer.stream.read(&mut buf) => match result {
+            result = stream.read(&mut buf) => match result {
                 Ok(n) => {
                     // Receive tcp message
                     if n == 0 {
@@ -232,7 +253,7 @@ async fn process_tcp(state: Arc<Mutex<State>>, stream: TcpStream) -> io::Result<
                     let mut buf = Vec::<u8>::from(buf);
                     buf.resize(n, 0);
                     let reader = Cursor::new(buf);
-                    if let Err(_) = parse_tcp_message(Arc::clone(&state), &mut peer, reader).await {
+                    if let Err(_) = parse_tcp_message(&mut peer, reader).await {
                         // Parse error
                         break;
                     }
@@ -242,20 +263,10 @@ async fn process_tcp(state: Arc<Mutex<State>>, stream: TcpStream) -> io::Result<
         }
     }
 
-    state
-        .lock()
-        .await
-        .tcp_tx
-        .remove(&peer.stream.peer_addr().unwrap());
-
     Ok(())
 }
 
-async fn parse_tcp_message(
-    state: Arc<Mutex<State>>,
-    peer: &mut TcpPeer,
-    mut reader: Cursor<Vec<u8>>,
-) -> io::Result<()> {
+async fn parse_tcp_message(peer: &mut TcpPeer, mut reader: Cursor<Vec<u8>>) -> io::Result<()> {
     reader.read_u32_v().await?;
     match reader.read_u8().await? {
         0 => {
@@ -263,31 +274,35 @@ async fn parse_tcp_message(
             let mut writer = Cursor::new(vec![]);
             writer.write_u8(0).await?;
             writer.write_string(&peer.id).await?;
-            writer.write_string(&peer.name).await?;
-            state
-                .lock()
-                .await
-                .tcp_broadcast(peer.stream.peer_addr().unwrap(), writer.get_ref())
-                .await;
+            writer.write_string(&peer.player_name).await?;
+            peer.tcp_tx
+                .send(TcpCommand::Broadcast {
+                    sender_addr: peer.addr,
+                    game: peer.game_uid.clone(),
+                    message: writer.get_ref().clone(),
+                })
+                .unwrap();
         }
         1 => {
             // Destroyed
             let mut writer = Cursor::new(vec![]);
             writer.write_u8(1).await?;
             writer.write_string(&peer.id).await?;
-            state
-                .lock()
-                .await
-                .tcp_broadcast(peer.stream.peer_addr().unwrap(), writer.get_ref())
-                .await;
+            peer.tcp_tx
+                .send(TcpCommand::Broadcast {
+                    sender_addr: peer.addr,
+                    game: peer.game_uid.clone(),
+                    message: writer.get_ref().clone(),
+                })
+                .unwrap();
         }
         2 => {
             // Heart beat
         }
         3 => {
             // Name
-            peer.name = reader.read_string().await?;
-            peer.game = reader.read_string().await?;
+            peer.player_name = reader.read_string().await?;
+            peer.game_uid = reader.read_string().await?;
             peer.game_name = reader.read_string().await?;
             let _version = reader.read_string().await?;
             peer.has_password = reader.read_u8().await? == 1;
@@ -300,11 +315,13 @@ async fn parse_tcp_message(
             writer.write_u8(4).await?;
             writer.write_string(&peer.id).await?;
             writer.write_string(&message).await?;
-            state
-                .lock()
-                .await
-                .tcp_broadcast(peer.stream.peer_addr().unwrap(), writer.get_ref())
-                .await;
+            peer.tcp_tx
+                .send(TcpCommand::Broadcast {
+                    sender_addr: peer.addr,
+                    game: peer.game_uid.clone(),
+                    message: writer.get_ref().clone(),
+                })
+                .unwrap();
         }
         5 => {
             // Save
@@ -316,15 +333,17 @@ async fn parse_tcp_message(
             let mut writer = Cursor::new(vec![]);
             writer.write_u8(5).await?;
             writer.write_u8(gravity).await?;
-            writer.write_string(&peer.name).await?;
+            writer.write_string(&peer.player_name).await?;
             writer.write_i32_le(x).await?;
             writer.write_f64_le(y).await?;
             writer.write_u16_le(room).await?;
-            state
-                .lock()
-                .await
-                .tcp_broadcast(peer.stream.peer_addr().unwrap(), writer.get_ref())
-                .await;
+            peer.tcp_tx
+                .send(TcpCommand::Broadcast {
+                    sender_addr: peer.addr,
+                    game: peer.game_uid.clone(),
+                    message: writer.get_ref().clone(),
+                })
+                .unwrap();
         }
         _ => {
             return Err(io::Error::new(
@@ -336,23 +355,62 @@ async fn parse_tcp_message(
     Ok(())
 }
 
-async fn process_udp(state: Arc<Mutex<State>>, udp_socket: &mut UdpSocket) -> io::Result<()> {
+async fn process_udp(
+    udp_socket: UdpSocket,
+    udp_tx: mpsc::Sender<UdpCommand>,
+    mut udp_rx: mpsc::Receiver<UdpCommand>,
+) -> io::Result<()> {
     let mut buf = [0u8; 1024];
-    let (len, addr) = udp_socket.recv_from(&mut buf).await.unwrap();
+    let mut peers = HashMap::<SocketAddr, UdpPeer>::new();
 
-    // Take exists peer, or make new one
-    let mut peer = state
-        .lock()
-        .await
-        .udp_peers
-        .remove(&addr)
-        .unwrap_or(UdpPeer::new(addr));
-    peer.last_connection = SystemTime::now();
+    loop {
+        tokio::select! {
+            Some(cmd) = udp_rx.recv() => {
+                match cmd {
+                    UdpCommand::CheckConnections => {
+                        let cur_time = SystemTime::now();
+                        peers.retain(|_, peer|
+                            cur_time.duration_since(peer.last_connection).unwrap() <= Duration::from_secs(120)
+                        );
+                    },
+                    UdpCommand::Broadcast {sender_addr, game, room, previous_room, message} => {
+                        // Broadcast to peers
+                        for (_, p) in peers.iter() {
+                            if p.addr != sender_addr
+                                && p.game_uid == game
+                                && (p.room == room || p.previous_room == previous_room) {
+                                udp_socket.send_to(&message, p.addr).await?;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok((len, addr)) = udp_socket.recv_from(&mut buf) => {
+                // Take exists peer, or make new one
+                let mut peer = peers.remove(&addr).unwrap_or(UdpPeer::new(addr));
+                peer.last_connection = SystemTime::now();
 
-    // Parse udp message
-    let mut buf = Vec::from(buf);
-    buf.resize(len, 0);
-    let mut reader = Cursor::new(buf);
+                // Parse udp message
+                let mut buf = Vec::from(buf);
+                buf.resize(len, 0);
+                let reader = Cursor::new(buf);
+                if let Err(_) = parse_udp_message(&mut peer, reader, &udp_tx).await {
+                    // Parse error
+                    continue;
+                }
+
+                // Insert the peer back
+                peers.insert(addr, peer);
+            }
+        }
+    }
+}
+
+async fn parse_udp_message(
+    peer: &mut UdpPeer,
+    mut reader: Cursor<Vec<u8>>,
+    tx: &mpsc::Sender<UdpCommand>,
+) -> io::Result<()> {
     match reader.read_u8().await? {
         0 => {
             // Initialize connection
@@ -360,29 +418,19 @@ async fn process_udp(state: Arc<Mutex<State>>, udp_socket: &mut UdpSocket) -> io
         1 => {
             // Receive position
             peer.id = reader.read_string().await?;
-            peer.game = reader.read_string().await?;
+            peer.game_uid = reader.read_string().await?;
             peer.room = reader.read_u16_le().await?;
 
             // Broadcast to peers
-            for (_, p) in state.lock().await.udp_peers.iter() {
-                if p.id == "" {
-                    continue;
-                }
-                if p.id == peer.id {
-                    continue;
-                }
-                if p.game != peer.game {
-                    continue;
-                }
-                if p.room != peer.previous_room {
-                    continue;
-                }
-                if p.killed {
-                    continue;
-                }
-                udp_socket.send_to(reader.get_ref(), p.addr).await?;
-            }
-            peer.previous_room = peer.room;
+            tx.send(UdpCommand::Broadcast {
+                sender_addr: peer.addr,
+                game: peer.game_uid.clone(),
+                room: peer.room,
+                previous_room: peer.previous_room,
+                message: reader.get_ref().clone(),
+            })
+            .await
+            .unwrap();
         }
         _ => {
             return Err(io::Error::new(
@@ -392,19 +440,5 @@ async fn process_udp(state: Arc<Mutex<State>>, udp_socket: &mut UdpSocket) -> io
         }
     }
 
-    // Insert the peer back
-    state.lock().await.udp_peers.insert(addr, peer);
-
     Ok(())
-}
-
-async fn check_udp_connections(state: Arc<Mutex<State>>) {
-    let cur_time = SystemTime::now();
-    for (addr, peer) in state.lock().await.udp_peers.iter() {
-        if cur_time.duration_since(peer.last_connection).unwrap() > Duration::from_secs(120)
-            || peer.killed
-        {
-            state.lock().await.udp_peers.remove(addr);
-        }
-    }
 }
