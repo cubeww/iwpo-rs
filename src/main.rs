@@ -186,7 +186,7 @@ async fn main() {
     let (udp_tx, udp_rx) = mpsc::channel::<UdpCommand>(16);
 
     // Http server
-    let http_listener = TcpListener::bind(format!("127.0.0.1:{}", HTTP_SERVER_PORT))
+    let http_listener = TcpListener::bind(format!("0.0.0.0:{}", HTTP_SERVER_PORT))
         .await
         .unwrap();
     info!("http server running at port {}", HTTP_SERVER_PORT);
@@ -223,7 +223,7 @@ async fn main() {
     });
 
     // Tcp server
-    let tcp_listener = TcpListener::bind(format!("127.0.0.1:{}", TCP_SERVER_PORT))
+    let tcp_listener = TcpListener::bind(format!("0.0.0.0:{}", TCP_SERVER_PORT))
         .await
         .unwrap();
     info!("tcp server running at port {}", TCP_SERVER_PORT);
@@ -244,7 +244,7 @@ async fn main() {
     });
 
     // Udp server
-    let udp_socket = UdpSocket::bind(format!("127.0.0.1:{}", UDP_SERVER_PORT))
+    let udp_socket = UdpSocket::bind(format!("0.0.0.0:{}", UDP_SERVER_PORT))
         .await
         .unwrap();
     info!("udp server running at port {}", UDP_SERVER_PORT);
